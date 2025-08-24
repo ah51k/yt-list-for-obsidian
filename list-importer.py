@@ -32,7 +32,8 @@ class Config:
     def __init__(self):
         self.config_file = os.path.join(os.path.expanduser("~"), ".youtube_playlist_config.json")
         self.default_config = {
-            "save_directory": os.path.expanduser("~")
+            "save_directory": os.path.expanduser("~"),
+            "base_files_directory": os.path.expanduser("~")
         }
         self.config = self.load_config()
 
@@ -59,15 +60,23 @@ class Config:
         self.config["save_directory"] = directory
         self.save_config()
 
+    def get_base_files_directory(self):
+        return self.config.get("base_files_directory", self.default_config["base_files_directory"])
+
+    def set_base_files_directory(self, directory):
+        self.config["base_files_directory"] = directory
+        self.save_config()
+
 class PlaylistProcessor(QThread):
     progress_updated = Signal(str)
     progress_value = Signal(int)  # Progress percentage
     finished = Signal(str, str, bool)  # message, details, success
     
-    def __init__(self, playlist_url, save_dir):
+    def __init__(self, playlist_url, save_dir, base_files_dir):
         super().__init__()
         self.playlist_url = playlist_url
         self.save_dir = save_dir
+        self.base_files_dir = base_files_dir
         
     def run(self):
         try:
@@ -101,20 +110,46 @@ class PlaylistProcessor(QThread):
             main_md_filename = os.path.join(main_folder, f"{safe_folder_name}.md")
             os.makedirs(main_folder, exist_ok=True)
             os.makedirs(videos_folder, exist_ok=True)
+            
+            # Get banner from playlist thumbnail
+            banner_url = playlist_info.get('thumbnail')
+            
             playlist_thumbnail = playlist_info.get('thumbnail')
+            
+            # Create base file
+            base_filename = f"{safe_folder_name}.base"
+            base_filepath = os.path.join(self.base_files_dir, base_filename)
+            
+            # Remove /mnt/win/obsidian-vault/ from the videos folder path for base file
+            videos_folder_for_base = videos_folder
+            if videos_folder.startswith('/mnt/win/obsidian-vault/'):
+                videos_folder_for_base = videos_folder.replace('/mnt/win/obsidian-vault/', '', 1)
+            
+            with open(base_filepath, 'w', encoding='utf-8') as base_file:
+                base_file.write(f"""views:
+  - type: cards
+    name: Table
+    filters:
+      and:
+        - file.inFolder("{videos_folder_for_base}")
+    sort:
+      - property: playlist_index
+        direction: ASC
+    imageAspectRatio: 0.5
+    image: note.thumbnail
+    cardSize: 250""")
+            
             with open(main_md_filename, 'w', encoding='utf-8') as main_md:
                 main_md.write(f"---\ntags: [playlist]\n")
                 if playlist_thumbnail:
                     main_md.write(f'thumbnail: {playlist_thumbnail}\n')
+                if banner_url:
+                    main_md.write(f'banner: {banner_url}\n')
+                    main_md.write(f'banner-x: 50\n')
+                    main_md.write(f'banner-y: 50\n')
                 main_md.write("---\n")
-                main_md.write(f'<span class = "mainpage">{playlist_title}</span>\n')
                 main_md.write('---\n')
-                main_md.write('```dataview\n')
-                main_md.write('table without id\n')
-                main_md.write('playlist_index as order, "![](" + thumbnail + ")" as thumbnail, file.link as title, duration\n')
-                main_md.write(f'from #playlist-{tag_safe_title}\n')
-                main_md.write('sort playlist_index asc\n')
-                main_md.write('```\n')
+                main_md.write(f'![[{base_filename}]]\n')
                 total_videos = len(playlist_info['entries'])
                 # First pass: collect all video info for navigation
                 video_info_list = []
@@ -136,7 +171,14 @@ class PlaylistProcessor(QThread):
                     else:
                         duration_str = "N/A"
                     url = f"https://www.youtube.com/watch?v={video_id}"
-                    thumbnail_url = f'https://i.ytimg.com/vi/{video_id}/default.jpg'
+                    
+                    # Get highest quality thumbnail for individual videos
+                    if 'maxresdefault' in entry.get('thumbnails', []):
+                        thumbnail_url = f'https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg'
+                    elif 'hqdefault' in entry.get('thumbnails', []):
+                        thumbnail_url = f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg'
+                    else:
+                        thumbnail_url = f'https://i.ytimg.com/vi/{video_id}/default.jpg'
                     safe_title = re.sub(r'[\\/*?:\"<>|]', "", title)
                     video_md_filename = f"{safe_title}.md"
                     
@@ -192,7 +234,7 @@ tags: [playlist-{tag_safe_title}]
             # Emit 100% completion
             self.progress_value.emit(100)
             
-            success_msg = f"✅ Done!\n📁 Folder created: {main_folder}\n📄 File created: {main_md_filename}"
+            success_msg = f"✅ Done!\n📁 Folder created: {main_folder}\n📄 File created: {main_md_filename}\n📄 Base file created: {base_filepath}"
             details = f"Successfully processed {total_videos} videos"
             logger.info(f"Successfully processed playlist with {total_videos} videos")
             self.finished.emit(success_msg, details, True)
@@ -205,12 +247,13 @@ class YoutubePlaylistToObsidianApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YouTube Playlist to Obsidian")
-        self.setGeometry(100, 100, 700, 500)
+        self.setGeometry(100, 100, 700, 600)
         self.processor_thread = None
         
         # Load configuration
         self.config = Config()
         self.save_dir = self.config.get_save_directory()
+        self.base_files_dir = self.config.get_base_files_directory()
 
         # Enhanced Dark Mode Configuration
         self.setStyleSheet("""
@@ -345,6 +388,27 @@ class YoutubePlaylistToObsidianApp(QWidget):
 
         main_layout.addLayout(dir_layout)
 
+        # Base files directory section
+        base_dir_layout = QHBoxLayout()
+        
+        self.base_dir_label = QLabel("Base Files Directory:")
+        self.base_dir_label.setFont(QFont("Arial", 12))
+        base_dir_layout.addWidget(self.base_dir_label)
+
+        self.base_dir_entry = QLineEdit()
+        self.base_dir_entry.setText(self.base_files_dir)
+        self.base_dir_entry.setReadOnly(True)
+        self.base_dir_entry.setFont(QFont("Arial", 11))
+        base_dir_layout.addWidget(self.base_dir_entry)
+
+        self.browse_base_button = QPushButton("Browse")
+        self.browse_base_button.setFont(QFont("Arial", 11))
+        self.browse_base_button.setToolTip("Select directory to save base files (Ctrl+B)")
+        self.browse_base_button.clicked.connect(self.browse_base_directory)
+        base_dir_layout.addWidget(self.browse_base_button)
+
+        main_layout.addLayout(base_dir_layout)
+
         # Buttons section
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(15)
@@ -395,6 +459,10 @@ class YoutubePlaylistToObsidianApp(QWidget):
         # Ctrl+O to browse directory
         browse_shortcut = QShortcut(QKeySequence.Open, self)
         browse_shortcut.activated.connect(self.browse_directory)
+        
+        # Ctrl+B to browse base directory
+        browse_base_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        browse_base_shortcut.activated.connect(self.browse_base_directory)
 
     def browse_directory(self):
         dir_path = QFileDialog.getExistingDirectory(
@@ -407,6 +475,18 @@ class YoutubePlaylistToObsidianApp(QWidget):
             self.save_dir = dir_path
             self.dir_entry.setText(dir_path)
             self.config.set_save_directory(dir_path)
+
+    def browse_base_directory(self):
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Base Files Directory",
+            self.base_files_dir,
+            QFileDialog.ShowDirsOnly
+        )
+        if dir_path:
+            self.base_files_dir = dir_path
+            self.base_dir_entry.setText(dir_path)
+            self.config.set_base_files_directory(dir_path)
 
     def clear_input(self):
         self.playlist_url_entry.clear()
@@ -430,13 +510,14 @@ class YoutubePlaylistToObsidianApp(QWidget):
         self.clear_button.setEnabled(False)
         self.playlist_url_entry.setEnabled(False)
         self.browse_button.setEnabled(False)
+        self.browse_base_button.setEnabled(False)
         
         # Show progress
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate progress
         
         # Start processing thread
-        self.processor_thread = PlaylistProcessor(playlist_url, self.save_dir)
+        self.processor_thread = PlaylistProcessor(playlist_url, self.save_dir, self.base_files_dir)
         self.processor_thread.progress_updated.connect(self.update_progress)
         self.processor_thread.progress_value.connect(self.update_progress_bar)
         self.processor_thread.finished.connect(self.on_processing_finished)
@@ -456,6 +537,7 @@ class YoutubePlaylistToObsidianApp(QWidget):
         self.clear_button.setEnabled(True)
         self.playlist_url_entry.setEnabled(True)
         self.browse_button.setEnabled(True)
+        self.browse_base_button.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.progress_label.setText("")
         
